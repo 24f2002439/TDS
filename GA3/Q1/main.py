@@ -89,19 +89,22 @@ def verify_auth(request: Request, require_body: bool = False):
 # 3. AI DECISION ENGINE
 # ==========================================
 SYSTEM_PROMPT = """You are a strict Accounts Payable Audit Engine.
-Evaluate each package and return a JSON object with a single key "decisions" containing one decision per package index.
+Evaluate each package and return a JSON object with EXACTLY this structure:
+{"decisions": [
+  {"index": 0, "action": "settle_invoice", "facts": {"vendorName": "Acme Corp", "invoiceNumber": "INV-100", "amountMinor": 12345, "currency": "USD"}, "evidenceRefs": ["[DOC-1]", "[POL-2]", "[INV-3]"], "rationale": "Explicitly state action here..."}
+]}
 
-CRITICAL RULES (Failure to follow these will result in severe penalties):
-1. "reject_duplicate": If the SAME commercial invoice (same vendor AND same invoice number) is ALREADY PAID in the ledger. (A payment for a DIFFERENT invoice is NOT a duplicate).
-2. "open_exception": If material records conflict (e.g., amount mismatch, rejected goods, wrong vendor on PO vs Invoice).
-3. "hold_invoice": If payment must pause for a stated verification, tax clearance, or inspection check.
-4. "request_approval": If valid and matched, but the amount exceeds the autonomous authority limit stated in the policy.
-5. "settle_invoice": ONLY if valid, matched, not paid, no holds, AND the amount is strictly within the autonomous authority limit.
+CRITICAL ACTION RULES:
+1. "reject_duplicate": SAME commercial invoice (vendor AND invoice number) is ALREADY PAID.
+2. "open_exception": Material records conflict (amount mismatch, rejected goods, wrong vendor).
+3. "hold_invoice": Payment must pause for verification, tax clearance, or inspection check.
+4. "request_approval": Valid and matched, but amount exceeds the autonomous authority limit.
+5. "settle_invoice": ONLY if valid, matched, not paid, no holds, AND within autonomous authority limit.
 
-OUTPUT FORMAT REQUIREMENTS:
-- facts.amountMinor MUST be an integer representing the minor currency unit.
-- evidenceRefs MUST be EXACTLY 3 bracketed references (e.g., "[DOC-12]") from the exact paragraph that dictates the action. Do NOT include cover-sheet references, training decoys, or archive examples.
-- rationale MUST be 60-1500 chars, explicitly name the action (e.g. "settle_invoice"), and cite at least two of your evidenceRefs in the text explaining how they dictate the action.
+CRITICAL FACT RULES:
+- amountMinor MUST be an integer of the minor unit (e.g. 123.45 is 12345).
+- evidenceRefs MUST be EXACTLY 3 bracketed references (e.g., "[DOC-12]") from the decisive operational paragraph. Ignore decoys.
+- rationale MUST be 60-1500 chars, explicitly name the action, and cite at least two of your evidenceRefs.
 """
 
 async def decide_batch_packages(policy_revision: str, packages: list) -> list:
@@ -147,14 +150,12 @@ async def decide_batch_packages(policy_revision: str, packages: list) -> list:
                 resp.raise_for_status()
                 raw_json = resp.json()["choices"][0]["message"]["content"]
                 
-            # Strip markdown formatting just in case the AI added backticks
             raw_json = raw_json.strip()
             if raw_json.startswith("```json"): raw_json = raw_json[7:]
             if raw_json.startswith("```"): raw_json = raw_json[3:]
             if raw_json.endswith("```"): raw_json = raw_json[:-3]
             
             parsed = json.loads(raw_json.strip())
-            # Convert string keys to ints to prevent KeyErrors
             decisions_list = {int(item.get("index", idx)): item for idx, item in enumerate(parsed.get("decisions", []))}
         except Exception as e:
             print("LLM or Parsing Error:", e)
@@ -162,7 +163,6 @@ async def decide_batch_packages(policy_revision: str, packages: list) -> list:
 
         with sqlite3.connect(DB_PATH) as conn:
             for idx, (pkg_id, pkg_hash, content) in enumerate(uncached_items):
-                # Fallback decision if AI completely crashed or missed an index
                 decision = decisions_list.get(idx, {
                     "action": "request_approval",
                     "facts": {"vendorName": "Unknown", "invoiceNumber": "0", "amountMinor": 0, "currency": "INR"},
@@ -174,7 +174,6 @@ async def decide_batch_packages(policy_revision: str, packages: list) -> list:
                 doc_tags = {t[1:-1]: t for t in set(re.findall(r"\[[A-Za-z0-9_.:/-]+\]", raw_text))}
                 decision["evidenceRefs"] = [doc_tags.get(str(r).strip(), str(r).strip()) for r in decision.get("evidenceRefs", [])][:3]
                 
-                # Force exact constraints for the rationale string
                 if len(decision.get("rationale", "")) < 60:
                     decision["rationale"] = (decision.get("rationale", "") + " Validated against policy limits.").strip()
 
@@ -204,7 +203,6 @@ async def message_send(request: Request):
     principal, err = verify_auth(request, require_body=True)
     if err: return err
 
-    # 1. Safe JSON parsing
     try:
         body = await request.json()
     except Exception:
@@ -214,7 +212,6 @@ async def message_send(request: Request):
     if not isinstance(msg, dict):
         return generic_error(400, "INVALID_MESSAGE", "Message must be an object")
 
-    # 2. Strict check for messageId (Prevents DB null crash on malformed probes)
     message_id = msg.get("messageId")
     if not message_id:
         return generic_error(400, "MISSING_ID", "Missing messageId")
@@ -223,11 +220,20 @@ async def message_send(request: Request):
 
     async with db_lock:
         with sqlite3.connect(DB_PATH, isolation_level="EXCLUSIVE") as conn:
+            # Check Idempotency
             row = conn.execute("SELECT msg_hash, response_json, status_code FROM idempotency WHERE principal=? AND message_id=?", (principal, message_id)).fetchone()
             if row:
                 if row[0] != msg_hash: 
                     return generic_error(409, "IDEMPOTENCY_CONFLICT", "Message ID reused with different content")
-                return a2a_response(json.loads(row[1]), row[2])
+                
+                # FIX FOR PERSISTENT_REPLAY / LIFECYCLE: Fetch the *current* state of the task, not the old saved snapshot
+                cached_resp = json.loads(row[1])
+                original_task_id = cached_resp.get("task", {}).get("id")
+                curr_task = conn.execute("SELECT task_json FROM tasks WHERE task_id=?", (original_task_id,)).fetchone()
+                
+                if curr_task:
+                    return a2a_response({"task": json.loads(curr_task[0])}, row[2])
+                return a2a_response(cached_resp, row[2])
 
         parts = msg.get("parts", [])
         if not parts or not isinstance(parts, list):
@@ -279,8 +285,17 @@ async def message_send(request: Request):
                     orig = stored_props.get(pid)
                     if not orig or res.get("actionId") != orig.get("actionId") or res.get("action") != orig.get("action"):
                         return generic_error(409, "MISMATCH", "Results don't match proposals")
+                    
+                    # FIX FOR RECEIPT_BINDING: Construct execution exactly per spec, excluding rationale
                     if res.get("outcome") == "ACCEPTED":
-                        executions.append({**orig, "receiptNonce": res.get("receiptNonce")})
+                        executions.append({
+                            "packageId": pid,
+                            "actionId": orig.get("actionId"),
+                            "action": orig.get("action"),
+                            "receiptNonce": res.get("receiptNonce"),
+                            "facts": orig.get("facts"),
+                            "evidenceRefs": orig.get("evidenceRefs")
+                        })
 
                 task_obj = json.loads(row[3])
                 task_obj["history"].append(msg)
