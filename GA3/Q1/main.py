@@ -81,20 +81,29 @@ def verify_auth(request: Request, require_body: bool = False):
 
 # --- LEAN & FAST SYSTEM PROMPT ---
 SYSTEM_PROMPT = """You are a strict Accounts Payable Audit Engine.
-Evaluate each package and return ONLY JSON with EXACTLY this structure:
-{"decisions": [{"index": 0, "action": "settle_invoice", "facts": {"vendorName": "Acme Corp", "invoiceNumber": "INV-100", "amountMinor": 12345, "currency": "USD"}, "evidenceRefs": ["[DOC-1]", "[POL-2]", "[INV-3]"], "rationale": "Action is settle_invoice because [DOC-1] matches [INV-3]."}]}
+Evaluate each package. Return JSON with EXACTLY this structure:
+{"decisions": [
+  {
+    "index": 0,
+    "analysis": "Ledger shows unpaid. No holds. Amount 50000 > limit 10000, requires approval.",
+    "action": "request_approval", 
+    "facts": {"vendorName": "Acme Corp", "invoiceNumber": "INV-100", "amountMinor": 50000, "currency": "USD"}, 
+    "evidenceRefs": ["[DOC-1]", "[POL-2]", "[INV-3]"], 
+    "rationale": "Action is request_approval because [INV-3] exceeds the [POL-2] autonomous limit."
+  }
+]}
 
-CRITICAL RULES:
-1. "reject_duplicate": EXACT SAME vendor AND invoice number is ALREADY PAID.
-2. "open_exception": Material records conflict.
-3. "hold_invoice": Payment must pause for stated verification.
-4. "request_approval": Valid, but amount exceeds autonomous authority limit.
-5. "settle_invoice": Valid, matched, not paid, no holds, AND within authority limit.
+CRITICAL DECISION TREE (Follow in exact order!):
+1. Check Ledger: If the EXACT SAME invoiceNumber from the SAME vendor is already marked PAID -> "reject_duplicate". (Different invoice numbers are NOT duplicates).
+2. Check Exceptions: If amounts/quantities mismatch, goods are damaged/rejected, or vendor names conflict -> "open_exception".
+3. Check Holds: If ANY document states payment must wait, pause, or is pending inspection/tax clearance -> "hold_invoice".
+4. Check Limits: Find the Autonomous Approval Limit in the Policy. If invoice amount > limit -> "request_approval".
+5. Settle (DANGER): ONLY use "settle_invoice" if valid, unpaid, no holds, AND strictly <= the autonomous limit. If in doubt, do NOT settle.
 
 FACT RULES:
-- amountMinor MUST be an integer of the minor unit (e.g. 123.45 is 12345).
-- evidenceRefs MUST be EXACTLY 3 bracketed references from the decisive paragraph. Ignore decoys.
-- rationale MUST be concise (max 2 sentences), name the action, and cite at least two evidenceRefs.
+- amountMinor MUST be an integer of the MINOR unit (e.g., 123.45 USD = 12345).
+- evidenceRefs MUST be EXACTLY 3 bracketed refs (e.g., "[DOC-1]") from the specific paragraphs proving the action. Exclude decoys.
+- rationale MUST name the action and cite at least two evidenceRefs explaining the match.
 """
 
 async def decide_batch_packages(policy_revision: str, packages: list) -> list:
