@@ -271,7 +271,7 @@ async def message_send(request: Request):
                 for res in data.get("results", []):
                     pid = res.get("packageId")
                     orig = stored_props.get(pid)
-                    if not orig or res.get("actionId") != orig["actionId"] or res.get("action") != orig["action"]:
+                    if not orig or res.get("actionId") != orig.get("actionId") or res.get("action") != orig.get("action"):
                         return generic_error(409, "MISMATCH", "Results don't match proposals")
                     if res.get("outcome") == "ACCEPTED":
                         executions.append({**orig, "receiptNonce": res.get("receiptNonce")})
