@@ -69,7 +69,7 @@ def generic_error(status_code: int, code: str, message: str) -> JSONResponse:
 # ==========================================
 # 2. SECURITY & AUTHENTICATION
 # ==========================================
-def verify_auth(request: Request):
+def verify_auth(request: Request, require_body: bool = False):
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         return None, generic_error(401, "UNAUTHORIZED", "Missing Bearer token")
@@ -78,25 +78,30 @@ def verify_auth(request: Request):
     if request.headers.get("A2A-Version") != "1.0":
         return None, generic_error(400, "UNSUPPORTED_VERSION", "A2A-Version 1.0 required")
         
+    if require_body:
+        ct = request.headers.get("Content-Type", "").lower()
+        if "application/a2a+json" not in ct:
+            return None, generic_error(400, "INVALID_MEDIA_TYPE", "application/a2a+json required")
+            
     return token, None
 
 # ==========================================
 # 3. AI DECISION ENGINE
 # ==========================================
-SYSTEM_PROMPT = """You are an expert Accounts Payable Audit Engine.
+SYSTEM_PROMPT = """You are a strict Accounts Payable Audit Engine.
 Evaluate each package and return a JSON object with a single key "decisions" containing one decision per package index.
 
-RULES FOR ACTIONS (Strict Priority):
-1. "reject_duplicate": SAME commercial invoice (vendor & invoice number) is ALREADY PAID in ledger.
-2. "open_exception": Material records conflict (amount mismatch, rejected goods, wrong vendor).
-3. "hold_invoice": Payment must pause for verification, tax clearance, or inspection.
-4. "request_approval": Valid and matched, but amount exceeds autonomous authority limit.
-5. "settle_invoice": Valid, matched, not paid, no holds, AND within autonomous authority limit.
+CRITICAL RULES (Failure to follow these will result in severe penalties):
+1. "reject_duplicate": If the SAME commercial invoice (same vendor AND same invoice number) is ALREADY PAID in the ledger. (A payment for a DIFFERENT invoice is NOT a duplicate).
+2. "open_exception": If material records conflict (e.g., amount mismatch, rejected goods, wrong vendor on PO vs Invoice).
+3. "hold_invoice": If payment must pause for a stated verification, tax clearance, or inspection check.
+4. "request_approval": If valid and matched, but the amount exceeds the autonomous authority limit stated in the policy.
+5. "settle_invoice": ONLY if valid, matched, not paid, no holds, AND the amount is strictly within the autonomous authority limit.
 
-RULES FOR OUTPUT:
-- facts.amountMinor MUST be an integer of the minor currency unit.
-- evidenceRefs MUST be EXACTLY 3 bracketed references (e.g., "[DOC-12]") from the decisive operational paragraph.
-- rationale MUST be 60-1500 chars, explicitly name the action, and cite at least two evidenceRefs.
+OUTPUT FORMAT REQUIREMENTS:
+- facts.amountMinor MUST be an integer representing the minor currency unit.
+- evidenceRefs MUST be EXACTLY 3 bracketed references (e.g., "[DOC-12]") from the exact paragraph that dictates the action. Do NOT include cover-sheet references, training decoys, or archive examples.
+- rationale MUST be 60-1500 chars, explicitly name the action (e.g. "settle_invoice"), and cite at least two of your evidenceRefs in the text explaining how they dictate the action.
 """
 
 async def decide_batch_packages(policy_revision: str, packages: list) -> list:
@@ -196,7 +201,7 @@ async def get_agent_card():
 
 @app.post("/a2a/message:send")
 async def message_send(request: Request):
-    principal, err = verify_auth(request)
+    principal, err = verify_auth(request, require_body=True)
     if err: return err
 
     # 1. Safe JSON parsing
@@ -217,10 +222,11 @@ async def message_send(request: Request):
     msg_hash = canonical_hash(msg)
 
     async with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
+        with sqlite3.connect(DB_PATH, isolation_level="EXCLUSIVE") as conn:
             row = conn.execute("SELECT msg_hash, response_json, status_code FROM idempotency WHERE principal=? AND message_id=?", (principal, message_id)).fetchone()
             if row:
-                if row[0] != msg_hash: return generic_error(409, "CONFLICT", "ID reused with different content")
+                if row[0] != msg_hash: 
+                    return generic_error(409, "IDEMPOTENCY_CONFLICT", "Message ID reused with different content")
                 return a2a_response(json.loads(row[1]), row[2])
 
         parts = msg.get("parts", [])
@@ -301,7 +307,7 @@ async def list_tasks(request: Request):
 
 @app.get("/a2a/tasks/{task_id}")
 async def get_task(task_id: str, request: Request):
-    principal, err = verify_auth(request)
+    principal, err = verify_auth(request, require_body=False)
     if err: return err
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute("SELECT principal, task_json FROM tasks WHERE task_id=?", (task_id,)).fetchone()
@@ -313,7 +319,7 @@ async def cancel_task(task_id: str, request: Request):
     principal, err = verify_auth(request)
     if err: return err
     async with db_lock:
-        with sqlite3.connect(DB_PATH) as conn:
+        with sqlite3.connect(DB_PATH, isolation_level="EXCLUSIVE") as conn:
             row = conn.execute("SELECT principal, state, task_json FROM tasks WHERE task_id=?", (task_id,)).fetchone()
             if not row or row[0] != principal: return generic_error(404, "NOT_FOUND", "Task not found")
             if row[1] != "TASK_STATE_INPUT_REQUIRED": return generic_error(409, "TERMINAL", "Already terminal")
